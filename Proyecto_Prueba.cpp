@@ -1,8 +1,13 @@
-// Visor de modelos glTF/GLB con texturas, fondo de imagen y control por teclado
-// OpenGL 3.3 + GLFW + GLAD + GLM + tiny_gltf_v3 + stb_image
-//
-// Controles:  W/S = girar arriba/abajo   A/D = girar izquierda/derecha
-//             Q = acercarse              E = alejarse        ESC = salir
+// Controles:
+//   W/S = girar arriba/abajo      A/D = girar izquierda/derecha
+//   Q = acercarse                 E = alejarse
+//   F = detener / reanudar el giro continuo
+//   ESPACIO = pausar / reanudar el recorrido por la curva
+//   1-4 = seleccionar punto de control (rojo)
+//   Flechas = mover el punto seleccionado en X/Y      Z / X = mover en profundidad
+//   V = mostrar / ocultar la curva
+//   C = la cámara sigue / deja de seguir al modelo
+//   ESC = salir
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -11,8 +16,6 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
-// Las implementaciones de stb_image (stb_image.cpp) y tiny_gltf_v3 (tiny_gltf_v3.c)
-// ya se compilan por separado en el proyecto, así que aquí solo se incluyen los headers.
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #include "tiny_gltf_v3.h"
@@ -24,7 +27,7 @@
 #include <string>
 #include <vector>
 
-// ---------- Datos del modelo ----------
+//  Datos del modelo
 struct Mesh {
     GLuint vao = 0, count = 0, tex = 0;
     glm::mat4 world{ 1.0f };
@@ -35,6 +38,37 @@ std::map<int, GLuint> texCache;
 std::string gDir = ".";
 glm::vec3 bmin(1e9f), bmax(-1e9f);
 
+//  Bézier 
+GLuint dynVao = 0, dynVbo = 0;
+
+// Bézier cúbica: B(t) = (1-t)^3 P0 + 3(1-t)^2 t P1 + 3(1-t) t^2 P2 + t^3 P3
+glm::vec3 bezier(const glm::vec3 p[4], float t) {
+    float u = 1.0f - t;
+    return u * u * u * p[0]
+        + 3.0f * u * u * t * p[1]
+        + 3.0f * u * t * t * p[2]
+        + t * t * t * p[3];
+}
+
+// Sube puntos a un buffer dinámico y los dibuja (líneas o puntos)
+void drawDynamic(const Shader& s, const std::vector<glm::vec3>& pts, GLenum mode, const glm::vec3& color) {
+    s.setVec3("color", color);
+    glBindVertexArray(dynVao);
+    glBindBuffer(GL_ARRAY_BUFFER, dynVbo);
+    glBufferData(GL_ARRAY_BUFFER, pts.size() * sizeof(glm::vec3), pts.data(), GL_DYNAMIC_DRAW);
+    glDrawArrays(mode, 0, (GLsizei)pts.size());
+}
+
+// Detecta el momento exacto en que se presiona una tecla (una vez por pulsación)
+bool teclaPulsada(GLFWwindow* win, int key) {
+    static std::map<int, bool> previo;
+    bool ahora = glfwGetKey(win, key) == GLFW_PRESS;
+    bool evento = ahora && !previo[key];
+    previo[key] = ahora;
+    return evento;
+}
+
+//  Carga del modelo glTF 
 static bool eq(tg3_str s, const char* lit) {
     return s.len == strlen(lit) && std::memcmp(s.data, lit, s.len) == 0;
 }
@@ -289,18 +323,52 @@ int main() {
 
     Shader modelShader(modelVertexSrc(), modelFragmentSrc());
     Shader bgShader(backgroundVertexSrc(), backgroundFragmentSrc());
+    Shader lineShader(lineVertexSrc(), lineFragmentSrc());
 
-    // Centrar y escalar el modelo para que siempre quepa en pantalla
+    // Buffer dinámico para dibujar la curva y los puntos de control
+    glGenVertexArrays(1, &dynVao);
+    glGenBuffers(1, &dynVbo);
+    glBindVertexArray(dynVao);
+    glBindBuffer(GL_ARRAY_BUFFER, dynVbo);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), (void*)0);
+    glEnableVertexAttribArray(0);
+    glPointSize(10.0f);
+
+    // Centrar y escalar el modelo (tamaño ~1 para que quepa en la curva)
     glm::vec3 center = (bmin + bmax) * 0.5f;
     glm::vec3 size = bmax - bmin;
-    float scale = 2.0f / glm::max(size.x, glm::max(size.y, size.z));
+    float scale = 1.0f / glm::max(size.x, glm::max(size.y, size.z));
 
     // Estado de la cámara / rotación controlada por teclado
     float yaw = 0.0f;        // izquierda / derecha (A / D)
     float pitch = 0.0f;      // arriba / abajo (W / S)
-    float distancia = 4.0f;  // Q acerca, E aleja
+    float distancia = 6.0f;  // Q acerca, E aleja
     const float velGiro = 1.5f;   // radianes por segundo
     const float velZoom = 3.0f;   // unidades por segundo
+
+    // Giro continuo (F lo detiene / reanuda)
+    float giro = 0.0f;
+    bool girando = true;
+    const float velGiroAuto = 1.2f;   // radianes por segundo
+
+    // Curva Bézier cúbica (4 puntos de control en espacio mundo)
+    glm::vec3 P[4] = {
+        glm::vec3(-2.0f, -0.8f, 0.0f),
+        glm::vec3(-1.0f,  1.8f, 0.0f),
+        glm::vec3(1.0f, -1.8f, 0.0f),
+        glm::vec3(2.0f,  0.8f, 0.0f)
+    };
+    int seleccionado = 0;
+    float t = 0.0f, dirT = 1.0f;
+    const float velCurva = 0.15f;     // recorridos por segundo
+    const float velPunto = 1.5f;      // unidades por segundo al mover un punto
+    bool curvaMoviendo = true;
+    bool verCurva = true;
+
+    // Cámara que sigue al modelo (C activa / desactiva)
+    bool seguirModelo = true;
+    glm::vec3 objetivoCam(0.0f);      // punto al que mira la cámara
+
     float ultimo = (float)glfwGetTime();
 
     while (!glfwWindowShouldClose(win)) {
@@ -309,6 +377,8 @@ int main() {
         ultimo = ahora;
 
         if (glfwGetKey(win, GLFW_KEY_ESCAPE) == GLFW_PRESS) break;
+
+        // Cámara / giro manual
         if (glfwGetKey(win, GLFW_KEY_D) == GLFW_PRESS) yaw += velGiro * dt;
         if (glfwGetKey(win, GLFW_KEY_A) == GLFW_PRESS) yaw -= velGiro * dt;
         if (glfwGetKey(win, GLFW_KEY_S) == GLFW_PRESS) pitch += velGiro * dt;
@@ -316,6 +386,35 @@ int main() {
         if (glfwGetKey(win, GLFW_KEY_Q) == GLFW_PRESS) distancia -= velZoom * dt;
         if (glfwGetKey(win, GLFW_KEY_E) == GLFW_PRESS) distancia += velZoom * dt;
         distancia = glm::clamp(distancia, 0.5f, 30.0f);
+
+        // Toggles
+        if (teclaPulsada(win, GLFW_KEY_F))     girando = !girando;
+        if (teclaPulsada(win, GLFW_KEY_SPACE)) curvaMoviendo = !curvaMoviendo;
+        if (teclaPulsada(win, GLFW_KEY_V))     verCurva = !verCurva;
+        if (teclaPulsada(win, GLFW_KEY_C))     seguirModelo = !seguirModelo;
+
+        // Seleccionar punto de control (1..4)
+        if (teclaPulsada(win, GLFW_KEY_1)) seleccionado = 0;
+        if (teclaPulsada(win, GLFW_KEY_2)) seleccionado = 1;
+        if (teclaPulsada(win, GLFW_KEY_3)) seleccionado = 2;
+        if (teclaPulsada(win, GLFW_KEY_4)) seleccionado = 3;
+
+        // Mover el punto seleccionado: flechas = X/Y, Z/X = profundidad
+        glm::vec3& pt = P[seleccionado];
+        if (glfwGetKey(win, GLFW_KEY_RIGHT) == GLFW_PRESS) pt.x += velPunto * dt;
+        if (glfwGetKey(win, GLFW_KEY_LEFT) == GLFW_PRESS) pt.x -= velPunto * dt;
+        if (glfwGetKey(win, GLFW_KEY_UP) == GLFW_PRESS) pt.y += velPunto * dt;
+        if (glfwGetKey(win, GLFW_KEY_DOWN) == GLFW_PRESS) pt.y -= velPunto * dt;
+        if (glfwGetKey(win, GLFW_KEY_Z) == GLFW_PRESS) pt.z += velPunto * dt;
+        if (glfwGetKey(win, GLFW_KEY_X) == GLFW_PRESS) pt.z -= velPunto * dt;
+
+        // Avance sobre la curva (ida y vuelta) y giro automático
+        if (curvaMoviendo) {
+            t += dirT * velCurva * dt;
+            if (t >= 1.0f) { t = 1.0f; dirT = -1.0f; }
+            if (t <= 0.0f) { t = 0.0f; dirT = 1.0f; }
+        }
+        if (girando) giro += velGiroAuto * dt;
 
         int w, h; glfwGetFramebufferSize(win, &w, &h);
         if (w == 0 || h == 0) { glfwPollEvents(); continue; }   // ventana minimizada
@@ -336,12 +435,20 @@ int main() {
         }
 
         // ----- Modelo -----
+        // Se traslada a la posición de la curva y gira sobre su propio centro
+        glm::vec3 posicion = bezier(P, t);
         glm::mat4 global(1.0f);
+        global = glm::translate(global, posicion);
         global = glm::rotate(global, pitch, glm::vec3(1, 0, 0));
-        global = glm::rotate(global, yaw, glm::vec3(0, 1, 0));
+        global = glm::rotate(global, yaw + giro, glm::vec3(0, 1, 0));
         global = glm::scale(global, glm::vec3(scale));
         global = glm::translate(global, -center);
-        glm::mat4 view = glm::lookAt(glm::vec3(0, 0, distancia), glm::vec3(0), glm::vec3(0, 1, 0));
+        // La cámara sigue al modelo con un suavizado para que no dé tirones
+        glm::vec3 destino = seguirModelo ? posicion : glm::vec3(0.0f);
+        objetivoCam += (destino - objetivoCam) * glm::min(1.0f, 5.0f * dt);
+        glm::mat4 view = glm::lookAt(objetivoCam + glm::vec3(0.0f, 0.0f, distancia),
+            objetivoCam,
+            glm::vec3(0.0f, 1.0f, 0.0f));
         glm::mat4 proj = glm::perspective(glm::radians(45.0f), (float)w / h, 0.1f, 100.0f);
 
         modelShader.use();
@@ -357,6 +464,28 @@ int main() {
             glBindTexture(GL_TEXTURE_2D, mesh.tex);
             glBindVertexArray(mesh.vao);
             glDrawElements(GL_TRIANGLES, mesh.count, GL_UNSIGNED_INT, 0);
+        }
+
+        // ----- Curva y puntos de control (encima de todo) -----
+        if (verCurva) {
+            glDisable(GL_DEPTH_TEST);
+            lineShader.use();
+            lineShader.setMat4("view", view);
+            lineShader.setMat4("proj", proj);
+
+            // Curva (64 segmentos)
+            std::vector<glm::vec3> curva;
+            for (int i = 0; i <= 64; i++) curva.push_back(bezier(P, i / 64.0f));
+            drawDynamic(lineShader, curva, GL_LINE_STRIP, glm::vec3(1.0f, 0.85f, 0.2f));
+
+            // Polígono de control
+            drawDynamic(lineShader, std::vector<glm::vec3>(P, P + 4), GL_LINE_STRIP, glm::vec3(0.5f));
+
+            // Puntos de control (el seleccionado en rojo)
+            for (int i = 0; i < 4; i++)
+                drawDynamic(lineShader, { P[i] }, GL_POINTS,
+                    i == seleccionado ? glm::vec3(1.0f, 0.2f, 0.2f) : glm::vec3(0.3f, 0.8f, 1.0f));
+            glEnable(GL_DEPTH_TEST);
         }
 
         glfwSwapBuffers(win);
